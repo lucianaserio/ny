@@ -24,10 +24,10 @@ from bokeh.io import show, output_notebook, push_notebook, curdoc
 from bokeh.plotting import figure
 
 
-from bokeh.models import (CategoricalColorMapper, HoverTool, ColumnDataSource, Panel, 
+from bokeh.models import (CategoricalColorMapper, HoverTool, ColumnDataSource, Panel, CustomJS,
                           FuncTickFormatter, NumeralTickFormatter, PrintfTickFormatter, SingleIntervalTicker, LinearAxis)
 from bokeh.models.widgets import (CheckboxGroup, Slider, RangeSlider, Tabs, CheckboxButtonGroup, Div,
-                                  TableColumn, DataTable, Select, RadioButtonGroup, RadioGroup, DateRangeSlider)
+                                  TableColumn, DataTable, Select, RadioButtonGroup, RadioGroup, DateRangeSlider, Button)
 
 from bokeh.models.widgets import Dropdown
 
@@ -53,16 +53,15 @@ def time_range(b, e, delta=pd.Timedelta(days=1)):
 
 # query cityofnewyork specific OData endpoint using 'query' as $query string
 # note: will fetch at most 'limit' rows (possibly using paging)
-def query(endpoint, query, limit = 10000):
+def query(endpoint, query, limit = 50000):
     url = 'https://data.cityofnewyork.us/resource/%s'%(endpoint)
     res_df = pd.DataFrame()
-    qlimit=1000
+    qlimit=10000
     for offset in range(0, limit, qlimit):
-
         res = requests.get(url, params={'$query': query + " limit %s offset %s" %(qlimit, offset)} )
         if res.status_code != 200:
             raise Exception('{}: for query {}, reason: {}'.format(res.status_code, query, res.content[:200]))
-        df = pd.read_csv(BytesIO(res.content))
+        df = pd.read_csv(BytesIO(res.content), low_memory=False)
 
         res_df = res_df.append(df, sort=True)
         if len(df.index) < qlimit:
@@ -103,125 +102,200 @@ cols_maps =\
         'house_no' : 'house_no',
         'work_on_floor' : 'work_on_floor',
         'job_description' : 'job_description',
-        'other_description': 'work_type'
+        'other_description': 'work_type',
     },
     filings_res:
     {
-        'date' : 'pre__filing_date',
+        'date' : 'approved',
         'borough': 'borough',
         'estimated_job_costs' : 'initial_cost',
         'street_name': 'street_name',
         'house_no' : 'house__',
         'work_on_floor' : None,
         'job_description' : 'job_description',
-        'other_description': 'other_description'
+        'other_description': 'other_description',
     }
 }
 
+# For Approvals: job_filing_number: Unique id for the filing; first
+# character is a letter representing the NYC Borough (B=Brooklyn,
+# M=Manhattan, Q=Queens, S=Staten Island, X=Bronx), next 8 characters
+# are numbers that make the Job Filing Number unique; last three
+# characters are a dash, a letter, and a number. letter is either
+# I=Initial, P=Post Approval Amendment, or S=Subsequent. number
+# indicates the sequence of the filing; I1 should always exist, you
+# can have multiple Subsequent filings, and the number indicates the
+# order in which they were filed.
+
+# For filings: job__: This is the unique identifier for the
+# application submitted to the Department. It may contain several work
+# types, and more work types may be added as the application review
+# and the work continues. It is a 9-digit number where the first digit
+# indicates the borough where the building is located.  • 1 =
+# Manhattan • 2 = Bronx • 3 = Brooklyn • 4 = Queens • 5 = Staten
+# Island
+
+mapping={"B":"3", "M":"1", "Q":"4", "S":"5", "X":"2"}   
+def remap_ids(id):
+    # convert first char to digic and drop last 3 bytes
+    return int(mapping[id[0]]+ id[1:9])
+
+
+
 assert (cols_maps[approval_res].keys() == cols_maps[filings_res].keys())
 cache_cols = list(cols_maps[filings_res].keys()) + jobs_cols
-
-
-def get_query_cols_for(endpoint):
-    cols_map = cols_maps[endpoint]
-    cols = [c for c in cols_map.values() if isinstance(c, str)]
-    if endpoint == approval_res:
-        return cols, 'issued_date'
-    else:
-        return cols + jobs_cols, 'pre__filing_date'
-
-def fixup_df_for(endpoint, source):
-    result = pd.DataFrame(columns=cache_cols)
-    cols_map = cols_maps[endpoint]
-    for d, s in cols_map.items():
-        if isinstance(s, str):
-            result[d] = source[s]
-        else:
-            result[d] = None
-        
-
-    if endpoint == approval_res:
-        result['date'] = pd.to_datetime(source['issued_date']).apply(pd.Timestamp)
-
-        for job, job_col in jobs_to_cols.items():
-            #bools = source['work_type'] == job
-            result[job_col] = False
-        result['other'] = ~source['work_type'].isin(jobs)
-    else:
-        result['date'] = pd.to_datetime(source['pre__filing_date']).apply(pd.Timestamp)
-
-        for c in jobs_cols:
-            result[c] = source[c]=='X'
-    result.set_index('date',inplace=True)
-    return result
-
-def make_empty_cache():
+    
+def make_empty_date_df():
     df = pd.DataFrame(columns=cache_cols)
     df = df.set_index('date')
     return (set(), df)
 
-query_cache=defaultdict(make_empty_cache)
+query_date_cache=defaultdict(make_empty_date_df)
 
-def save_cache(endpoint, fetched_weeks, cache):
-    query_cache[endpoint] = (fetched_weeks, cache)
-    print('saving cache', '/tmp/' + endpoint)
-    cache.to_csv('/tmp/' + endpoint)
-    print('saving cache done')
+def save_date_cache(endpoint, fetched_weeks, cache):
+    query_date_cache[endpoint] = (fetched_weeks, cache)
+    print('saving date cache', '/tmp/date.' + endpoint)
+    cache.to_csv('/tmp/date.' + endpoint)
+    print('saving date cache done')
 
-def load_cache(endpoint):
-    fetched_weeks, cache = query_cache[endpoint]
+def load_date_cache(endpoint):
+    fetched_weeks, cache = query_date_cache[endpoint]
 
     if not fetched_weeks:
         try:
-            print('loading cache', '/tmp/' + endpoint)
-            new_cache = pd.read_csv('/tmp/' + endpoint)
+            print('loading date cache', '/tmp/date.' + endpoint)
+            new_cache = pd.read_csv('/tmp/date.' + endpoint)
             new_cache['date'] = pd.to_datetime(new_cache['date']).apply(pd.Timestamp)
 
             new_cache.set_index('date', inplace=True)
             if set(new_cache.columns) != set(cache.columns):
-                raise Exception('bad cache: mismatched columns', sorted(new_cache.columns), sorted(cache.columns))
+                raise Exception('bad date cache: mismatched columns', sorted(new_cache.columns), sorted(cache.columns))
             cache = new_cache
 
             fetched_weeks = set(d - relativedelta(weekday=Monday(-1)) for d in cache.index.unique())
-            query_cache[endpoint] = (fetched_weeks, cache)
-            print('loading cache done (entries: {})'.format(len(cache)))
+            query_date_cache[endpoint] = (fetched_weeks, cache)
+            print('loading date cache done (entries: {})'.format(len(cache)))
         except Exception as e:
-            print('no cache or bad cache in ', '/tmp/' + endpoint, e)
+            print('no cache or bad date cache in ', '/tmp/date.' + endpoint, e)
     return fetched_weeks, cache
-            
-def query_dates(endpoint, date_start, date_end):
-    fetched = 0
-    
+
+def query_approvals(date_start, date_end):
+    print(datetime.datetime.now(),'\tquery approvals start')                
     wanted = list(time_range(date_start, date_end))
     
     # we fetch one week at a time
     wanted_weeks = set(d - relativedelta(weekday=Monday(-1)) for d in wanted)
-    fetched_weeks, cache = load_cache(endpoint)#query_cache[endpoint]
+    fetched_weeks, cache = load_date_cache(approval_res)
+    old_cache_index = cache.index
     missing_weeks = wanted_weeks - fetched_weeks
     
     # new fetched after fetch
     fetched_weeks = fetched_weeks | missing_weeks
-    query_cols, date_col = get_query_cols_for(endpoint)
+
+    cols_map = cols_maps[approval_res]
+    query_cols = [c for c in cols_map.values() if isinstance(c, str)]
+    print(datetime.datetime.now(),'\t\tcomputed missing, count:', len(missing_weeks))
+    fetched = 0
     for i in missing_weeks:
         next = i + pd.Timedelta(days=7)
+        range = list(time_range(i, next))
         start = i.strftime('%Y-%m-%dT00:00:00.000')
         end = next.strftime('%Y-%m-%dT00:00:00.000')
-        range = list(time_range(i, next))
-        
-        df = query(endpoint, "select {cols} where {date} >= '{start}' "\
-                            "and {date} < '{end}' "
-                            "order by {date} asc".format(
+        q =  "select {cols} where issued_date >= '{start}' "\
+                            "and issued_date < '{end}' "\
+                            "order by issued_date asc".format(
                                 cols=','.join(query_cols),
-                                date=date_col,
                                 start=start, 
-                                end=end))
-        print('Requested {} - {}; Received rows: {}'.format(start, end, len(df)))
-        df = fixup_df_for(endpoint, df)
-        cache=cache.append(df, sort=True)
-    if missing_weeks:
+                                end=end)
+        print(datetime.datetime.now(),'\t\tget start, range:', i, next )
+        source = query(approval_res,q)
+        print(datetime.datetime.now(),'\t\tget end, count', len(source))
+        result = pd.DataFrame(columns=cache_cols)
+        for d, s in cols_map.items():
+            result[d] = source[s]
+
+        result['date'] = pd.to_datetime(source['issued_date']).apply(pd.Timestamp)
+
+        for job, job_col in jobs_to_cols.items():
+            result[job_col] = False
+        result['other'] = ~source['work_type'].isin(jobs)
+
+        result.set_index('date',inplace=True)
+        fetched+=len(result)
+        cache=cache.append(result, sort=True)
+    print(datetime.datetime.now(),'\t\tfetch done')        
+    if set(cache.index) != set(old_cache_index):
         cache.sort_index(inplace=True)
-        save_cache(endpoint, fetched_weeks, cache)
-    return cache[(cache.index >= date_start) & (cache.index < date_end)]
+        print(datetime.datetime.now(),'\t\tindex sorted')        
+        save_date_cache(approval_res, fetched_weeks, cache)
+        print(datetime.datetime.now(),'\t\tcache saved')          
+    res = cache[date_start:date_end]
+    print(datetime.datetime.now(),'\tquery approvals end')
+    return res
+    #return cache[(cache.index >= date_start) & (cache.index < date_end)]
+
+def query_filings(date_start, date_end):
+    print(datetime.datetime.now(),'\tquery filings start')                    
+    wanted = list(time_range(date_start, date_end))
+    
+    # we fetch one week at a time
+    wanted_weeks = set(d - relativedelta(weekday=Monday(-1)) for d in wanted)
+    fetched_weeks, cache = load_date_cache(filings_res)
+    old_cache_index = cache.index
+    missing_weeks = wanted_weeks - fetched_weeks
+    
+    # new fetched after fetch
+    fetched_weeks = fetched_weeks | missing_weeks
+
+    cols_map = cols_maps[filings_res]
+    cols = [c for c in cols_map.values() if isinstance(c, str)]
+    query_cols = cols+jobs_cols
+    print(datetime.datetime.now(),'\t\tcomputed missing, count:', len(missing_weeks))
+    fetched=0
+    for i in missing_weeks:
+        next = i + pd.Timedelta(days=7)
+        range = list(time_range(i, next))
+        start = i.strftime('%m/%d/%Y')
+        end= next.strftime('%m/%d/%Y')
+        q =  "select {cols} where approved >= '{start}' "\
+                            "and approved < '{end}' "\
+                            "and building_type != '1-2-3 FAMILY' "\
+                            "order by approved asc".format(
+                                cols=','.join(query_cols),
+                                start=start,
+                                end=end)
+        print(datetime.datetime.now(),'\t\tget start, range:', i, next )        
+        source = query(filings_res, q)
+        print(datetime.datetime.now(),'\t\tget end, count', len(source))
+
+        result = pd.DataFrame(columns=cache_cols)
+
+        for d, s in cols_map.items():
+            if isinstance(s, str):
+                result[d] = source[s]
+            else:
+                result[d] = None
+
+        result['date'] = pd.to_datetime(source['approved'])\
+                           .apply(pd.Timestamp)
+        result['estimated_job_costs'] = result['estimated_job_costs']\
+            .str.replace('$', '').astype(float)
+        for c in jobs_cols:
+            result[c] = source[c]=='X'
+        result.set_index('date',inplace=True)
+        fetched  += len(result)
+        cache=cache.append(result, sort=True)
+    print(datetime.datetime.now(),'\t\tfetch done')
+    if set(cache.index) != set(old_cache_index):
+        cache.sort_index(inplace=True)
+        print(datetime.datetime.now(),'\t\tindex sorted')
+        save_date_cache(filings_res, fetched_weeks, cache)
+        print(datetime.datetime.now(),'\t\tcache saved')        
+    res = cache[date_start:date_end]
+    print(datetime.datetime.now(),'\tquery filings end')                
+    return res
+    #return cache[(cache.index >= date_start) & (cache.index < date_end)]
+
 
 # DateRangeSlider has a bug, sometimes value is a pair of Timestamps, sometimes is a float or int (fractional millis since the epoch)
 def fixup_date(date):
@@ -232,12 +306,46 @@ def fixup_date(date):
             date = pd.Timestamp(date)
     return pd.Timestamp(date.date())
 
-    
+# JavaScript code for table download button
+download_js=R"""
+function table_to_csv(source, df_columns, columns) {
+    const nrows = source.get_length()
+    const lines = [columns.join(',')]
+
+    for (let i = 0; i < nrows; i++) {
+        let row = [];
+        for (let j = 0; j < df_columns.length; j++) {
+            const column = df_columns[j]
+            row.push(source.data[column][i].toString())
+        }
+        lines.push(row.join(','))
+    }
+    return lines.join('\n').concat('\n')
+}
+
+
+const filename = 'data_result.csv'
+const filetext = table_to_csv(source, df_columns, columns)
+const blob = new Blob([filetext], { type: 'text/csv;charset=utf-8;' })
+
+//addresses IE
+if (navigator.msSaveBlob) {
+    navigator.msSaveBlob(blob, filename)
+} else {
+    const link = document.createElement('a')
+    link.href = URL.createObjectURL(blob)
+    link.download = filename
+    link.target = '_blank'
+    link.style.visibility = 'hidden'
+    link.dispatchEvent(new MouseEvent('click'))
+}
+"""    
 def modify_doc(doc):
     
     # function to make a dataset for histogram based on a list of set filters
 
-    slider_date_end = datetime.date.today()
+    # stop two days ago, it will take sometime for data to be uploaded
+    slider_date_end = datetime.date.today() - relativedelta(hours=48)
     slider_date_start = slider_date_end - relativedelta(months=6, day=1) # at most 2 months ago    
     
     # return delta and align for a range according to bin_width
@@ -259,20 +367,38 @@ def modify_doc(doc):
 
         return delta, align
 
+    last_query=None
+    last_query_result=None
+    def query_data(date_start, date_end):
+        nonlocal last_query
+        nonlocal last_query_result
+        if last_query == (date_start, date_end):
+            return last_query_result
+        print(datetime.datetime.now(),'\tstart query', )
+        approvals = query_approvals(date_start, date_end)
+        
+        filings = query_filings(date_start, date_end)
+        print(datetime.datetime.now(),'\tend query', )
+        assert list(filings.columns) == list(approvals.columns)
+        all_df = pd.concat([approvals, filings])
+        print(datetime.datetime.now(),'\tend concat', )
+        last_query_result = all_df
+        last_query = (date_start, date_end)
+        return all_df
+    
     old_jobs_count = None
-    def make_dataset(endpoint, borough_list, date_start, date_end, bin_width, jobidx):
+    def make_dataset(borough_list, date_start, date_end, bin_width, jobidx):
+        print (datetime.datetime.now(), 'start make_dataset')
         nonlocal old_jobs_count
         delta, align = align_range(bin_width)
         date_start += align
         date_end += align + delta
         date_end = min(date_end, pd.Timestamp(datetime.datetime.now().date()))
-        all_df = query_dates(endpoint, date_start, date_end)
-
+        all_df = query_data(date_start, date_end)
         if jobidx == 0:
             df = all_df
         else:
             assert old_jobs_count is not None
-            #print (jobidx, len(old_jobs_count))
             old_job_row = old_jobs_count.iloc[jobidx-1]
             if old_job_row['is_categ']:
                 # some jobs are categorical
@@ -280,27 +406,29 @@ def modify_doc(doc):
             else:
                 # others we have to look in 'other'
                 df = all_df[all_df['other_description'] == old_job_row['job_selector']]
-        
+        print(datetime.datetime.now(),'\tjob filtered', )
+
         def histograms():
             prev_buckets = None
             for i, borough_name in enumerate(borough_list):
-                if borough_name == 'Whole New York':
+                print(datetime.datetime.now(),'\tstart histogram for:', borough_name)
+                if borough_name == 'NEW YORK':
                     subset = df
                 else:
                     subset = df [df['borough'] == borough_name] 
+                print(datetime.datetime.now(),'\t\tborough filtered')
  
                 edges = list(time_range(date_start, date_end, delta))
-                #print (subset['estimated_job_costs'])
                 buckets = subset['estimated_job_costs'].groupby(lambda x: x - align)\
                                                        .agg(sum=np.sum, 
                                                             mean=np.mean,
                                                             median=np.median,
                                                             amax=np.max, 
                                                             len=len)
-
+                print(datetime.datetime.now(),'\t\tbuckets done')
                 max_subset = subset.groupby(lambda x: x-align)\
                                    .apply(lambda rows: rows.iloc[np.argmax(rows['estimated_job_costs'].values)])
-                
+                print(datetime.datetime.now(),'\t\tmax_subset done')                
                 # it is possible that buckets do not cover the full range, so we create 
                 # another data frame for the full range and fill it with 0 
                 tmp=pd.DataFrame(index=edges, columns=buckets.columns)
@@ -309,7 +437,7 @@ def modify_doc(doc):
                 # then we copy the subset shared with the other dataframe
                 tmp.loc[buckets.index & tmp.index ] = buckets.loc[buckets.index & tmp.index]
                 buckets = tmp
-            
+                print(datetime.datetime.now(),'\t\tbuckets fixup done')                            
                 # extend edges with an extra 'after-the-end' element
                 edges = edges + [edges[-1] + delta]                    
                 buckets.sort_index()
@@ -344,7 +472,7 @@ def modify_doc(doc):
                     buckets['f_address'] = ''
                     buckets['f_job_description'] = ''
                 prev_buckets = buckets
-
+                print(datetime.datetime.now(),'\t\tbuckets done')                            
                 yield buckets.reset_index()
 
         # counts of all well knonw jobs (last one is others, don't use it)
@@ -374,7 +502,6 @@ def modify_doc(doc):
             if old_job_selector in new_job_selectors:
                 # the old job is in the new list
                 new_jobidx = new_job_selectors.index(old_job_selector) + 1
-                #print('idx+1 of {} in {} is :{} '.format(old_job_selector, new_job_selectors, new_jobidx))
             else:
                 # artificially add the old job
                 row = old_job_row.copy()
@@ -383,30 +510,29 @@ def modify_doc(doc):
         assert 0 <= new_jobidx <= len(new_job_count)
                         
         old_jobs_count = new_job_count
-        #print(new_job_count, new_jobidx)
-        
+        print(datetime.datetime.now(),'\tend counts', )        
         #Dataframe to hold information
         by_borough = pd.DataFrame()
         # Overall dataframe
         all_buckets = list(histograms())
+        print(datetime.datetime.now(),'\tend histograms', )        
         by_borough = by_borough.append(all_buckets, sort=False)
+        print(datetime.datetime.now(),'\tend append', )        
         by_borough.sort_values(['name', 'left'], inplace=True)
-        #random.shuffle(tmp_jobs)
+        print(datetime.datetime.now(),'\tend sort', )        
         return ColumnDataSource(by_borough), ['All Jobs'] + list(new_job_count['label']), new_jobidx
 
     def make_plot(src, title, y_label, tooltip, column):
         # Blank plot with correct labels
-        p = figure(#plot_width = 500, plot_height = 500, 
-                   title = title,
+        p = figure(title = title,
                    x_axis_type='datetime',
-                   #sizing_mode='stretch_height',
                    x_axis_label = 'Date', y_axis_label = y_label)            
         # Quad glyphs to create a histogram
         p.quad(source = src, bottom = column +'_bottom', top = column + '_top', left = 'left', right = 'right',
-               color = 'color', fill_alpha = 0.7, hover_fill_color = 'color', legend_label = 'name',
+               color = 'color', fill_alpha = 0.7, hover_fill_color = 'color', legend_group = 'name',
                hover_fill_alpha = 1.0, line_color = 'black')
-        
-                          
+        p.legend.background_fill_alpha=0.5
+        p.legend.location='bottom_left'
         if column == 'amax':
             tooltips = [('Period:','@f_period'),
                         ('Borough', '@name'), 
@@ -455,8 +581,7 @@ def modify_doc(doc):
     old_params = [None]
     def do_update(force=False):
         try:
-            new_params = (approval_res,
-                          [borough_selection.labels[i] for i in borough_selection.active],
+            new_params = ([borough_selection.labels[i] for i in borough_selection.active],
                           fixup_date(date_select.value[0]),
                           fixup_date(date_select.value[1]),
                           binwidth_select.value,
@@ -490,37 +615,29 @@ def modify_doc(doc):
         hide_spinner()
     
     spinner_text = """
-    <!-- https://www.w3schools.com/howto/howto_css_loader.asp -->
-    <div class="loader" >
-    <style scoped>
-    .loader {
-        border: 16px solid #f3f3f3; /* Light grey */
-        border-top: 16px solid #3498db; /* Blue */
-        border-radius: 50%;
-        margin: auto;
-        width: 50px;
-        height: 50px;
-        animation: spin 2s linear infinite;
-    }
+<!-- https://www.w3schools.com/howto/howto_css_loader.asp -->
+<div class="loader">
+<style scoped>
+.loader {
+    border: 16px solid #f3f3f3; /* Light grey */
+    border-top: 16px solid #3498db; /* Blue */
+    border-radius: 50%;
+    width: 120px;
+    height: 120px;
+    margin: auto;
+    animation: spin 2s linear infinite;
+}
 
-    @keyframes spin {
-        0% { transform: rotate(0deg); }
-        100% { transform: rotate(360deg); }
-    } 
-    </style>
-    </div>
-    """
-    div_spinner = Div(text="",width=120,height=120)
-    def show_spinner():
-        div_spinner.text = spinner_text
-    def hide_spinner():
-        div_spinner.text = ""
+@keyframes spin {
+    0% { transform: rotate(0deg); }
+    100% { transform: rotate(360deg); }
+} 
+</style>
+</div>
+"""
 
-    # binwidth_select = RadioButtonGroup(labels=valid_bin_widths,
-    #                                    active=valid_bin_widths.index(default_bin_width)) #index of 'week', i.e. 0
-
-    # binwidth_select.on_change('active', update)
-
+    div_spinner = Div(text=spinner_text, width=120, height=120)
+    div_spinner.sizing_mode = "stretch_both"
 
     binwidth_select = Dropdown(label='week', menu=['day', 'week', 'month']) #index of 'week', i.e. 0
     binwidth_select.value = 'week'
@@ -536,12 +653,9 @@ def modify_doc(doc):
                                   value=(date_default_start,date_default_end), 
                                   callback_policy='mouseup', # do not start untill mouse released
                                   step=1,
-                                  callback_throttle=1000
-                                  #sizing_mode='stretch_height'
-    )
+                                  callback_throttle=1000)
     date_select.on_change('value', update_no_op) # this just enables the spinner
     # workaround broken callback_policy for DateRangeSlider
-    doc.add_periodic_callback(time_update, 1000)
     borough_selection_labels = ['NEW YORK','QUEENS', 'MANHATTAN', 'STATEN ISLAND', 'BROOKLYN', 'BRONX']
     borough_selection = CheckboxGroup(labels=borough_selection_labels,
                                       active = list(range(1, len(borough_selection_labels))),
@@ -569,17 +683,21 @@ def modify_doc(doc):
              ('Most Expensive Project', 'Max cost', 'cost', 'amax'),
              ('Total Project Cost', 'Total project cost', 'cost', 'sum'),
              ('Mean Project Cost', 'Mean project cost', 'cost', 'mean'),
-             ('Median Project Cost', 'Median project cost', 'cost', 'median')]
+             ('Median Project Cost', 'Median project cost', 'cost', 'median'),]
+
+    tabs_ref = None
+    def show_spinner():
+        if tabs_ref:
+            tabs_ref.tabs = tabs_spinner
+    def hide_spinner():
+        if tabs_ref:
+            tabs_ref.tabs = tabs_content
+
     do_update()
     plots = [ make_plot(src, *args) for args in data ]
 
     for p in plots:
         p.sizing_mode='stretch_both'
-
-    #row(column(borough_selection,row(binwidth_select, date_select)), div_spinner, sizing_mode='stretch_both'),
-    instrument_row = row(borough_selection, row(binwidth_select, jobs_selection, date_select), sizing_mode='stretch_width')
-    plot_grid = grid(plots + [None], ncols=3)
-    plot_tab = Panel(child=plot_grid, title = 'Histogram')
 
     table_column_names = [
         ('f_period', 'Period'),
@@ -592,13 +710,43 @@ def modify_doc(doc):
         ('f_address', 'Max Cost Project Address'),
         ('f_job_description', 'Max Cost Project Description'),
     ]
+                
+    download_button = Button(label="Download", button_type="success")
+    download_button.js_on_click(CustomJS(args=dict(source=src,
+                                                   df_columns = [ x for x, _ in table_column_names],
+                                                   columns = [ y for _, y in table_column_names]),
+                                code=download_js))
+    legend_button = Button(label="Hide Legend")
+    def toggle_legend(*args):
+        if legend_button.label == "Hide Legend":
+            legend_button.label = "Show Legend"
+        else:
+            legend_button.label = "Hide Legend"
+        for p in plots:
+            p.legend.visible = not p.legend.visible
+    legend_button.on_click(toggle_legend)
+    #row(column(borough_selection,row(binwidth_select, date_select)), div_spinner, sizing_mode='stretch_both'),
+    instrument_row = row(borough_selection,
+                         column(row(binwidth_select, jobs_selection, download_button, legend_button),
+                                date_select, sizing_mode='stretch_width'), sizing_mode='stretch_width')
+    plot_grid = grid(plots +[None], ncols=3)
+    plot_tab = Panel(child=plot_grid, title = 'Histogram')
     
     table_columns = [TableColumn(field=f, title=t) for f, t in table_column_names]
     data_table = DataTable(columns=table_columns, source=src)
     data_table.sizing_mode='stretch_both'
     data_tab = Panel(child=data_table, title='Data')
-    tabs = Tabs(tabs=[plot_tab, data_tab])
+
+    
+    
+    tabs_content=[plot_tab, data_tab]
+    spinner_grid=grid([div_spinner], ncols=1,
+                      sizing_mode='stretch_both')
+    tabs_spinner = [Panel(child=spinner_grid, title='Histogram'), Panel(child=spinner_grid, title='Data')]
+    
+    tabs = Tabs(tabs=tabs_spinner)
     tabs.sizing_mode='stretch_both'
+    tabs_ref = tabs
     col = column(
         instrument_row,
         #plot_grid,
@@ -606,5 +754,8 @@ def modify_doc(doc):
         sizing_mode='stretch_both')
     root = col
     doc.add_root(root)
+
+    doc.add_periodic_callback(time_update, 1000)
+
 
 modify_doc(curdoc())
